@@ -1,8 +1,7 @@
 package pw.shoujo.d.utils
 
 import pw.shoujo.d._
-import pw.shoujo.d.presentation.BaseTFABuilder.GoWith
-import pw.shoujo.d.presentation.{BaseTFABuilder, Save}
+import pw.shoujo.d.presentation.{BaseTFABuilder, ExposeOnFinish, Instruction, Save}
 import pw.shoujo.n.presentation.Transition
 import pw.shoujo.scheme.Primitive
 import pw.shoujo.utils._
@@ -31,15 +30,16 @@ class BaseCompiler[Tin <: Primitive[Tin], Tpe] extends Compiler[Int, Tin, Tpe] {
     protected def teClosure(fa: ♄, cis: Set[ClosureItem]): Set[ClosureItem] = {
         case class Prioritized(ci: ClosureItem, priority: Int)
         val queue = mutable.Queue.concat(cis.map(Prioritized(_, 0)))
+        val tagAddresses = maxTagAddressesFromClosure(cis)
         val closure = convertToMutableSet(queue)
-        var addressFakeCounter = cis.map(_.mapItems.values.maxOption.getOrElse(-1)).maxOption.getOrElse(-1)
         while (queue.nonEmpty) {
             val p = queue.dequeue()
             val reachable = fa.epsilonTransitions(p.ci.state).map { case Transition(_, to, byTag) =>
                 val mapItems: MapItems = byTag match {
                     case Some(tag) =>
-                        addressFakeCounter += 1
-                        Map(tag -> addressFakeCounter)
+                        val address = tagAddresses(tag) + 1
+                        tagAddresses(tag) = address
+                        Map(tag -> address)
                     case None =>
                         Map.empty
                 }
@@ -93,10 +93,22 @@ class BaseCompiler[Tin <: Primitive[Tin], Tpe] extends Compiler[Int, Tin, Tpe] {
                     val closure = teClosure(fa, wave)
                     val closureUnambiguous = closure.groupBy(_.state).map(Function.tupled(disambiguate)).toSet
                     val to = cacheOfStates.getOrElseUpdate(closureUnambiguous, {
+                        val to = generateStateId
+                        closureUnambiguous.filter(_.state == fa.fin).foreach { ci =>
+                            val finisher = builder.finishers.getOrElseUpdate(to, mutable.ArrayBuffer.empty)
+                            finisher.appendAll(ci.mapItems.map { case (tag, address) => ExposeOnFinish(tag, address) })
+                        }
                         queue.enqueue(closureUnambiguous)
-                        generateStateId
+                        to
                     })
-                    builder(from ~> to) = GoWith(in, Nil)
+                    val instructions = mutable.ArrayBuffer.empty[Instruction]
+                    for {
+                        ci <- closureUnambiguous
+                        saveIns <- ci.mapItems.map { case (tag, address) => Save(tag, address) }
+                    } {
+                        instructions.append(saveIns)
+                    }
+                    builder(from ~> to) = (in, instructions.toSeq)
                 }
             }
         }
@@ -111,5 +123,13 @@ class BaseCompiler[Tin <: Primitive[Tin], Tpe] extends Compiler[Int, Tin, Tpe] {
     private def disambiguate(state: Int, ambiguousItems: Set[ClosureItem]): ClosureItem = {
         val mapItems = ambiguousItems.map(_.mapItems).toSeq.sortWith(≺).head
         ClosureItem(state, mapItems)
+    }
+    
+    private def maxTagAddressesFromClosure(closure: Set[ClosureItem]): mutable.Map[Tpe, Int] = {
+        val base = closure
+            .flatMap(_.mapItems)
+            .groupBy(_._1)
+            .map { case (tag, mapItems) => tag -> mapItems.map(_._2).max }
+        mutable.Map.empty[Tpe, Int].withDefaultValue(-1) ++ base
     }
 }
